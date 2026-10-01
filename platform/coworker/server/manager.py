@@ -114,6 +114,9 @@ class SessionManager:
         # GUI super-agent surface: connected clients (send callbacks) + pending approval.
         self._sa_clients: set[Any] = set()
         self._sa_pending: Optional[asyncio.Future] = None
+        # Typing presence across connected GUI clients (multiple open windows/devices watching
+        # the same super-agent): client_key -> [{"userId": ..., "typing": bool}, ...].
+        self._sa_typing: dict[str, list[dict[str, Any]]] = {}
         # Automation: scheduled tasks store + the tick scheduler (started in the lifespan).
         self.task_store = TaskStore(base / "automation.db")
         self.scheduler = Scheduler(self.task_store, self._run_scheduled_task)
@@ -1017,6 +1020,39 @@ class SessionManager:
 
     def sa_unregister(self, send_cb: Any) -> None:
         self._sa_clients.discard(send_cb)
+
+    def sa_set_typing(
+        self, client_key: str, user_id: Any, typing: bool
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Record whether `user_id` is currently typing from the client identified by
+        `client_key` (one entry per connected GUI window/device). Returns the full typing
+        state so the caller can broadcast it."""
+        entries = self._sa_typing.setdefault(client_key, [])
+        for entry in entries:
+            if entry["userId"] == user_id:
+                entry["typing"] = bool(typing)
+                break
+        else:
+            entries.append({"userId": user_id, "typing": bool(typing)})
+        return self.sa_typing_state()
+
+    def sa_clear_client(self, client_key: str) -> dict[str, list[dict[str, Any]]]:
+        """Drop all typing entries for a client (its connection closed)."""
+        self._sa_typing.pop(client_key, None)
+        return self.sa_typing_state()
+
+    def sa_typing_state(self) -> dict[str, list[dict[str, Any]]]:
+        return {key: list(entries) for key, entries in self._sa_typing.items()}
+
+    async def sa_broadcast_typing(
+        self, client_key: str, user_id: Any, typing: bool
+    ) -> None:
+        state = self.sa_set_typing(client_key, user_id, typing)
+        await self._sa_broadcast({"type": "typing", "data": state})
+
+    async def sa_broadcast_client_cleared(self, client_key: str) -> None:
+        state = self.sa_clear_client(client_key)
+        await self._sa_broadcast({"type": "typing", "data": state})
 
     async def _sa_broadcast(self, message: dict) -> None:
         for cb in list(self._sa_clients):
