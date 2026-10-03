@@ -354,6 +354,20 @@ TOOL_DEFS: tuple[ConnectorToolDef, ...] = (
         "List Stripe invoices.",
     ),
     ConnectorToolDef(
+        "shopify",
+        "shopify_list_orders",
+        "List orders",
+        "read",
+        "List Shopify orders.",
+    ),
+    ConnectorToolDef(
+        "shopify",
+        "commerce_revenue_report",
+        "Revenue report",
+        "read",
+        "Combined Shopify + Stripe revenue, fees, and order-status report.",
+    ),
+    ConnectorToolDef(
         "asana",
         "asana_list_workspaces",
         "List workspaces",

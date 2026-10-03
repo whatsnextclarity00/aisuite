@@ -861,6 +861,7 @@ _NEW_CONNECTORS = {
     "gitlab": {"token": "glpat-x"},
     "discord": {"bot_token": "B0T"},
     "stripe": {"api_key": "rk_test_x"},
+    "shopify": {"shop_domain": "my-store.myshopify.com", "access_token": "shpat_x"},
     "asana": {"token": "asana_pat"},
     "hubspot": {"token": "pat-x"},
     "dropbox": {"access_token": "dbx"},
@@ -887,6 +888,7 @@ def test_new_connector_descriptors_listed(tmp_path):
     assert all(t["kind"] == "read" for t in by_name["dropbox"]["tools"])
     assert all(t["kind"] == "read" for t in by_name["box"]["tools"])
     assert all(t["kind"] == "read" for t in by_name["quickbooks"]["tools"])
+    assert all(t["kind"] == "read" for t in by_name["shopify"]["tools"])
 
 
 def test_new_connectors_connect_and_gate_tools(tmp_path):
@@ -907,6 +909,10 @@ def test_new_connectors_connect_and_gate_tools(tmp_path):
     assert "linear_search_issues" in names and "box_search" in names
     assert "gitlab_search" not in names and "stripe_list_charges" not in names
 
+    tools = make_integration_tools(secrets, enabled_connectors={"shopify"})
+    names = {t.__name__ for t in tools}
+    assert "shopify_list_orders" in names and "commerce_revenue_report" in names
+
 
 def test_new_tools_error_when_not_connected(tmp_path):
     from coworker.connectors.integration_tools import make_integration_tools
@@ -924,6 +930,8 @@ def test_new_tools_error_when_not_connected(tmp_path):
     assert "not connected" in tools["dropbox_list_folder"]()["error"]
     assert "not connected" in tools["box_read_file"]("1")["error"]
     assert "not connected" in tools["quickbooks_query"]("SELECT * FROM Bill")["error"]
+    assert "not connected" in tools["shopify_list_orders"]()["error"]
+    assert "not connected" in tools["commerce_revenue_report"]()["error"]
 
 
 def _connected_tools(tmp_path, monkeypatch, calls):
@@ -1014,6 +1022,103 @@ def test_new_tools_request_routing(tmp_path, monkeypatch):
         "name": "order_update",
         "language": {"code": "en_US"},
     }
+
+    tools["shopify_list_orders"](status="open", max_results=500)
+    assert (
+        calls[-1]["url"]
+        == "https://my-store.myshopify.com/admin/api/2024-01/orders.json"
+    )
+    assert calls[-1]["headers"]["X-Shopify-Access-Token"] == "shpat_x"
+    assert calls[-1]["params"] == {"status": "open", "limit": 250}  # clamped
+
+
+def test_commerce_revenue_report_combines_shopify_and_stripe(tmp_path, monkeypatch):
+    import coworker.connectors.integration_tools as it
+
+    secrets = SecretStore(tmp_path / "secrets.json")
+    secrets.put(
+        "shopify:default",
+        {
+            "shop_domain": "my-store.myshopify.com",
+            "access_token": "shpat_x",
+            "enabled": True,
+        },
+    )
+    secrets.put("stripe:default", {"api_key": "rk_test_x", "enabled": True})
+
+    def fake_request(method, url, *, headers=None, params=None, json=None, auth=None):
+        if "orders.json" in url:
+            return {
+                "ok": True,
+                "data": {
+                    "orders": [
+                        {"financial_status": "paid", "total_price": "100.00"},
+                        {"financial_status": "paid", "total_price": "50.00"},
+                        {"financial_status": "pending", "total_price": "20.00"},
+                        {"financial_status": "refunded", "total_price": "10.00"},
+                    ]
+                },
+            }
+        if url == "https://api.stripe.com/v1/charges":
+            return {
+                "ok": True,
+                "data": {
+                    "data": [
+                        {
+                            "status": "succeeded",
+                            "amount": 15000,
+                            "balance_transaction": {"fee": 450},
+                        },
+                        {
+                            "status": "succeeded",
+                            "amount": 5000,
+                            "balance_transaction": {"fee": 175},
+                        },
+                        {"status": "failed", "amount": 2000},
+                    ]
+                },
+            }
+        raise AssertionError(f"unexpected url: {url}")
+
+    monkeypatch.setattr(it, "_request", fake_request)
+    tools = {t.__name__: t for t in it.make_integration_tools(secrets)}
+
+    report = tools["commerce_revenue_report"](days=30)
+    assert report["window_days"] == 30
+    assert report["shopify"] == {
+        "order_count": 4,
+        "revenue": 150.0,
+        "status_counts": {"paid": 2, "pending": 1, "refunded": 1},
+    }
+    assert report["stripe"] == {
+        "charge_count": 2,
+        "gross_revenue": 200.0,
+        "fees": 6.25,
+        "net_revenue": 193.75,
+    }
+
+
+def test_commerce_revenue_report_without_stripe_connected(tmp_path, monkeypatch):
+    import coworker.connectors.integration_tools as it
+
+    secrets = SecretStore(tmp_path / "secrets.json")
+    secrets.put(
+        "shopify:default",
+        {
+            "shop_domain": "my-store.myshopify.com",
+            "access_token": "shpat_x",
+            "enabled": True,
+        },
+    )
+
+    monkeypatch.setattr(
+        it, "_request", lambda *a, **k: {"ok": True, "data": {"orders": []}}
+    )
+    tools = {t.__name__: t for t in it.make_integration_tools(secrets)}
+
+    report = tools["commerce_revenue_report"]()
+    assert report["shopify"]["order_count"] == 0
+    assert "not connected" in report["stripe"]["error"]
 
 
 def test_new_write_tools_require_approval(tmp_path, monkeypatch):

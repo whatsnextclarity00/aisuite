@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from html.parser import HTMLParser
 from typing import Any, Callable, Optional
@@ -176,6 +177,15 @@ def _linear_gql(api_key: str, query: str, variables: dict[str, Any]) -> dict[str
 
 def _clamp(n: Any, default: int = 10, ceiling: int = 20) -> int:
     return max(1, min(int(n or default), ceiling))
+
+
+def _shopify_base(profile: dict[str, Any]) -> str:
+    domain = str(profile.get("shop_domain", "")).strip().rstrip("/")
+    return f"https://{domain}/admin/api/2024-01"
+
+
+def _shopify_headers(token: str) -> dict[str, str]:
+    return {"X-Shopify-Access-Token": token, "Accept": "application/json"}
 
 
 def _qbo_base(profile: dict[str, Any]) -> str:
@@ -1398,6 +1408,130 @@ def make_integration_tools(
                 [],
             ),
             caps=["stripe", "read"],
+        )
+    )
+
+    def shopify_list_orders(
+        status: str = "any", max_results: int = 10
+    ) -> dict[str, Any]:
+        profile, err = _profile(secrets, "shopify", "shop_domain", "access_token")
+        if err:
+            return err
+        return _request(
+            "GET",
+            f"{_shopify_base(profile)}/orders.json",
+            headers=_shopify_headers(profile["access_token"]),
+            params={
+                "status": status or "any",
+                "limit": _clamp(max_results, ceiling=250),
+            },
+        )
+
+    shopify_list_orders.__name__ = "shopify_list_orders"
+    tools.append(
+        _attach(
+            shopify_list_orders,
+            _schema(
+                "shopify_list_orders",
+                "List Shopify orders. status is any, open, closed, or cancelled.",
+                {"status": {"type": "string"}, "max_results": {"type": "integer"}},
+                [],
+            ),
+            caps=["shopify", "read"],
+        )
+    )
+
+    def commerce_revenue_report(days: int = 30) -> dict[str, Any]:
+        profile, err = _profile(secrets, "shopify", "shop_domain", "access_token")
+        if err:
+            return err
+        window_days = max(1, min(int(days or 30), 365))
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(days=window_days)
+
+        orders_out = _request(
+            "GET",
+            f"{_shopify_base(profile)}/orders.json",
+            headers=_shopify_headers(profile["access_token"]),
+            params={
+                "status": "any",
+                "limit": 250,
+                "created_at_min": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        )
+        if "error" in orders_out:
+            return orders_out
+        orders = orders_out["data"].get("orders", [])
+
+        revenue = 0.0
+        status_counts: dict[str, int] = {}
+        for order in orders:
+            fin_status = order.get("financial_status") or "unknown"
+            status_counts[fin_status] = status_counts.get(fin_status, 0) + 1
+            if fin_status == "paid":
+                revenue += float(order.get("total_price") or 0)
+
+        report: dict[str, Any] = {
+            "window_days": window_days,
+            "shopify": {
+                "order_count": len(orders),
+                "revenue": round(revenue, 2),
+                "status_counts": status_counts,
+            },
+        }
+
+        stripe_profile, stripe_err = _profile(secrets, "stripe", "api_key")
+        if stripe_err:
+            report["stripe"] = stripe_err
+            return report
+
+        charges_out = _request(
+            "GET",
+            "https://api.stripe.com/v1/charges",
+            headers=_bearer_headers(stripe_profile["api_key"]),
+            params={
+                "created[gte]": int(since.timestamp()),
+                "limit": 100,
+                "expand[]": "data.balance_transaction",
+            },
+        )
+        if "error" in charges_out:
+            report["stripe"] = charges_out
+            return report
+
+        charges = charges_out["data"].get("data", [])
+        gross = fees = 0.0
+        succeeded = 0
+        for charge in charges:
+            if charge.get("status") != "succeeded":
+                continue
+            succeeded += 1
+            gross += float(charge.get("amount") or 0) / 100
+            txn = charge.get("balance_transaction")
+            if isinstance(txn, dict):
+                fees += float(txn.get("fee") or 0) / 100
+
+        report["stripe"] = {
+            "charge_count": succeeded,
+            "gross_revenue": round(gross, 2),
+            "fees": round(fees, 2),
+            "net_revenue": round(gross - fees, 2),
+        }
+        return report
+
+    commerce_revenue_report.__name__ = "commerce_revenue_report"
+    tools.append(
+        _attach(
+            commerce_revenue_report,
+            _schema(
+                "commerce_revenue_report",
+                "Combined Shopify + Stripe revenue report over the trailing N days: "
+                "Shopify order revenue and status breakdown, plus Stripe gross revenue, "
+                "fees, and net revenue when Stripe is connected.",
+                {"days": {"type": "integer"}},
+                [],
+            ),
+            caps=["shopify", "stripe", "read"],
         )
     )
 

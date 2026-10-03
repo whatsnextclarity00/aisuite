@@ -193,6 +193,16 @@ def _validate_dropbox(creds: dict) -> ValidationResult:
     )
 
 
+def _validate_shopify(creds: dict) -> ValidationResult:
+    domain = str(creds.get("shop_domain", "")).strip()
+    return _validate_whoami(
+        "GET",
+        f"https://{domain}/admin/api/2024-01/shop.json",
+        headers={"X-Shopify-Access-Token": creds.get("access_token", "")},
+        identity=lambda d: d["shop"]["name"],
+    )
+
+
 def _quickbooks_host(creds: dict) -> str:
     env = str(creds.get("environment", "")).lower()
     return (
@@ -629,6 +639,36 @@ DESCRIPTORS: list[ConnectorDescriptor] = [
             "In the Stripe Dashboard, create a restricted API key with read access to Customers, Charges, and Invoices.",
             "Paste the key below. The connector only exposes read tools.",
         ],
+    ),
+    ConnectorDescriptor(
+        name="shopify",
+        title="Shopify",
+        icon="⛁",
+        blurb="Read-only access to orders and revenue.",
+        auth="api_token",
+        two_way=False,
+        fields=[
+            Field(
+                "shop_domain",
+                "Shop domain",
+                secret=False,
+                help="Your store's myshopify.com domain.",
+                placeholder="my-store.myshopify.com",
+            ),
+            Field(
+                "access_token",
+                "Admin API access token",
+                secret=True,
+                help="From a custom app with read_orders access.",
+                placeholder="shpat_…",
+            ),
+        ],
+        instructions=[
+            "In Shopify admin, go to Settings → Apps and sales channels → Develop apps.",
+            "Create a custom app, grant it the read_orders scope, and install it.",
+            "Copy the Admin API access token and paste it with your shop domain below.",
+        ],
+        validate=_validate_shopify,
     ),
     ConnectorDescriptor(
         name="asana",
