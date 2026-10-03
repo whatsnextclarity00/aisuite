@@ -434,6 +434,68 @@ def test_ws_set_mode_auto_skips_approval(tmp_path):
     assert (proj / "a.py").read_text() == "x"
 
 
+# -- GUI super-agent typing presence ---------------------------------------------
+
+# Fixture shape: client_key -> list of {"userId": ..., "typing": bool} entries, one
+# entry per user currently known to that connected GUI client.
+TYPING_STATE_FIXTURE = {
+    "client_key_1": [{"userId": 1, "typing": False}],
+    "client_key_2": [{"userId": 2, "typing": True}],
+}
+
+
+def test_sa_typing_state_starts_empty(tmp_path):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    assert manager.sa_typing_state() == {}
+
+
+def test_sa_set_typing_builds_fixture_shape(tmp_path):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    for client_key, entries in TYPING_STATE_FIXTURE.items():
+        for entry in entries:
+            manager.sa_set_typing(client_key, entry["userId"], entry["typing"])
+    assert manager.sa_typing_state() == TYPING_STATE_FIXTURE
+
+
+def test_sa_set_typing_updates_existing_user_entry(tmp_path):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    manager.sa_set_typing("client_key_1", 1, True)
+    manager.sa_set_typing("client_key_1", 1, False)
+    assert manager.sa_typing_state() == {
+        "client_key_1": [{"userId": 1, "typing": False}]
+    }
+
+
+def test_sa_clear_client_drops_its_entries(tmp_path):
+    manager = SessionManager(workspace=tmp_path, provider=ScriptedProvider([]))
+    manager.sa_set_typing("client_key_1", 1, False)
+    manager.sa_set_typing("client_key_2", 2, True)
+    manager.sa_clear_client("client_key_1")
+    assert manager.sa_typing_state() == {
+        "client_key_2": [{"userId": 2, "typing": True}]
+    }
+
+
+def test_ws_superagent_typing_round_trip_and_broadcast(tmp_path):
+    client = _client(tmp_path, [])
+    with client.websocket_connect("/ws/superagent?client_key=client_key_1") as watcher:
+        assert watcher.receive_json()["type"] == "ready"
+        with client.websocket_connect(
+            "/ws/superagent?client_key=client_key_2"
+        ) as typer:
+            assert typer.receive_json()["type"] == "ready"
+
+            typer.send_json({"type": "typing", "userId": 2, "typing": True})
+            seen = [watcher.receive_json(), typer.receive_json()]
+            assert all(e["type"] == "typing" for e in seen)
+            assert seen[-1]["data"] == {"client_key_2": [{"userId": 2, "typing": True}]}
+
+        # The typer disconnected: its entries are cleared and broadcast to the watcher.
+        cleared = watcher.receive_json()
+        assert cleared["type"] == "typing"
+        assert cleared["data"] == {}
+
+
 def test_ws_session_resume_via_store(tmp_path):
     # First connection runs a turn and persists the session.
     client = _client(tmp_path, [_text("first answer")])

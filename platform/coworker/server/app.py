@@ -344,6 +344,7 @@ def create_app(manager: SessionManager) -> FastAPI:
     @app.websocket("/ws/superagent")
     async def ws_superagent(ws: WebSocket) -> None:
         await ws.accept()
+        client_key = ws.query_params.get("client_key") or uuid.uuid4().hex
 
         async def send(message: dict) -> None:
             await ws.send_json(message)
@@ -355,6 +356,7 @@ def create_app(manager: SessionManager) -> FastAPI:
                 "data": {
                     "running": manager.gateway is not None,
                     "transcript": manager.sa_transcript(),
+                    "typing": manager.sa_typing_state(),
                 },
             }
         )
@@ -370,10 +372,15 @@ def create_app(manager: SessionManager) -> FastAPI:
                     manager.sa_resolve_approval(message.get("decision", "deny"))
                 elif kind == "interrupt" and manager.superagent is not None:
                     manager.superagent.engine.request_interrupt()
+                elif kind == "typing":
+                    await manager.sa_broadcast_typing(
+                        client_key, message.get("userId"), bool(message.get("typing"))
+                    )
         except WebSocketDisconnect:
             pass
         finally:
             manager.sa_unregister(send)
+            await manager.sa_broadcast_client_cleared(client_key)
 
     @app.websocket("/ws/session/{session_id}")
     async def ws_session(ws: WebSocket, session_id: str) -> None:
